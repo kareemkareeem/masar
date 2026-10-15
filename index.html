@@ -2701,16 +2701,9 @@
                     await navigator.credentials.store(new PasswordCredential({ id: email, password: pass, name }));
                 }
             } catch (credentialError) { /* The browser may decline credential storage. */ }
-            const userId = data.user && data.user.id;
-            if (userId) {
-                const { error: perr } = await sb.from('profiles').insert({ id: userId, full_name: name,
-                    role: 'student' });
-                if (perr && !perr.message.includes('duplicate')) {
-                    errEl.textContent = 'تم إنشاء الحساب. جاري إكمال ملفك الشخصي...';
-                    errEl.style.color = 'var(--accent)';
-                    errEl.style.display = 'block';
-                }
-            }
+            // The auth.users trigger creates the profile and tenant membership.
+            // Do not insert profiles from the browser: tenant RLS correctly blocks
+            // an unaffiliated user, and the trigger is the trusted bootstrap path.
             if (data.user && data.user.confirmed_at === null) {
                 errEl.textContent = '✅ تم إنشاء الحساب وكلمة المرور. تحقّق من بريدك لتأكيد الحساب، ثم سجّل دخولك.';
                 errEl.style.color = 'var(--accent)';
@@ -2732,26 +2725,39 @@
         // ===== تحميل البيانات =====
         // =============================================
         async function bootAfterAuth() {
-            const { data: sess } = await sb.auth.getSession();
-            if (!sess || !sess.session) { showAuthScreen(); return; }
-            const userId = sess.session.user.id;
-            let { data: profs, error } = await sb.from('profiles').select('*').eq('id', userId).single();
-            if ((error || !profs)) {
-                const meta = sess.session.user.user_metadata || {};
-                const fallbackName = meta.full_name || (sess.session.user.email || 'User').split('@')[0];
-                const { data: created, error: cerr } = await sb.from('profiles').insert({ id: userId, full_name: fallbackName,
-                    role: 'student' }).select().single();
-                if (cerr || !created) {
+            try {
+                const { data: sess, error: sessionError } = await sb.auth.getSession();
+                if (sessionError) throw sessionError;
+                if (!sess?.session?.user?.id) { showAuthScreen(); return; }
+                const userId = sess.session.user.id;
+                const { data: existingProfile, error: profileError } = await sb
+                    .from('profiles').select('*').eq('id', userId).maybeSingle();
+                if (profileError) {
+                    console.error('Profile lookup failed:', profileError);
                     showAuthScreen();
-                    showToast('حدثت مشكلة في تحميل حسابك', 'error');
+                    showToast('تعذر قراءة ملف حسابك (' + (profileError.code || 'Supabase') + '): ' + profileError.message, 'error');
                     return;
                 }
-                profs = created;
+
+                let loadedProfile = existingProfile;
+                if (!loadedProfile) {
+                    // Existing auth users are not reprocessed by the auth.users
+                    // trigger. Creating a tenant-bound profile from the browser
+                    // would bypass the trusted bootstrap model and fail tenant RLS.
+                    showAuthScreen();
+                    showToast('حسابك موجود لكن ملفه غير مربوط بالمؤسسة. اطلب من مسؤول النظام تشغيل إصلاح ربط الحسابات القديمة في Supabase.', 'error');
+                    return;
+                }
+                profile = loadedProfile;
+                await loadAllData();
+                showAppScreen();
+                setupRealtime();
+            } catch (error) {
+                console.error('Account bootstrap failed:', error);
+                hideLoading();
+                showAuthScreen();
+                showToast('تعذر بدء حسابك: ' + (error?.message || 'خطأ غير معروف'), 'error');
             }
-            profile = profs;
-            await loadAllData();
-            showAppScreen();
-            setupRealtime();
         }
 
         function showAuthScreen() {
@@ -3348,7 +3354,11 @@
             } catch (error) {
                 hideLoading();
                 const code = error?.code || '';
-                const msg = code === '23505' ? 'You already have an enrollment request for this course.' : (error?.message || 'Unknown error');
+                const rawMessage = error?.message || 'Unknown error';
+                const isMaxStudentsAmbiguous = code === '42702' && /max_students/i.test(rawMessage);
+                const msg = code === '23505' ? 'You already have an enrollment request for this course.' :
+                    isMaxStudentsAmbiguous ? 'The database enrollment trigger has an ambiguous max_students reference. This must be corrected in the Supabase database function before enrollment can succeed.' :
+                    rawMessage;
                 showToast('Enrollment request failed: ' + msg, 'error');
                 console.error('Enrollment request error:', error);
                 if (button) button.disabled = false;
@@ -4039,13 +4049,18 @@
                         if (readError || !enroll) throw readError || new Error('طلب التسجيل غير موجود.');
                         const { error } = await sb.from('enrollments').delete().eq('id', id);
                         if (error) throw error;
+                        await loadAllData();
+                        if (enrollments.some(item => String(item.id) === String(id)) ||
+                            pendingEnrollments.some(item => String(item.id) === String(id))) {
+                            throw new Error('لم يُحذف الطلب؛ سياسة DELETE في RLS لا تسمح لك بإزالته أو أن الطلب ما زال موجودًا.');
+                        }
                         const { error: notificationError } = await sb.from('notifications').insert({
                             user_id: enroll.student_id,
                             title: '❌ تم رفض Enrollment request',
                             body: 'تم رفض طلبك للتسجيل في الCourse'
                         });
                         if (notificationError) console.warn('Rejection notification could not be sent:', notificationError.message);
-                        await loadAllData(); hideLoading(); showToast('تم الرفض'); renderApp();
+                        hideLoading(); showToast('تم الرفض'); renderApp();
                     } catch (error) {
                         hideLoading(); showToast('تعذر رفض الطلب: ' + (error?.message || 'خطأ غير معروف') + ' — تحقق من RLS.', 'error'); console.error('Enrollment rejection failed:', error);
                     }
@@ -5535,6 +5550,11 @@
                         if (error) throw error;
                     }
                     await loadAllData();
+                    if (!button.dataset.searchApprove &&
+                        (enrollments.some(item => String(item.id) === String(id)) ||
+                         pendingEnrollments.some(item => String(item.id) === String(id)))) {
+                        throw new Error('لم يُحذف الطلب؛ تحقق من سياسة DELETE في RLS لهذا الكورس.');
+                    }
                     hideLoading();
                     showToast(button.dataset.searchApprove ? 'تم قبول التسجيل.' : button.dataset.searchReject ? 'تم رفض طلب التسجيل.' : 'تمت إزالة التسجيل.');
                     renderApp();
@@ -5634,9 +5654,14 @@
                     if (fetchError || !enrollData) throw fetchError || new Error('طلب التسجيل غير موجود.');
                     const { error } = await sb.from('enrollments').delete().eq('id', id);
                     if (error) throw error;
+                    await loadAllData();
+                    if (enrollments.some(item => String(item.id) === String(id)) ||
+                        pendingEnrollments.some(item => String(item.id) === String(id))) {
+                        throw new Error('لم يُحذف طلب الالتحاق. سياسة DELETE في RLS لا تسمح بحذفه لهذا الكورس.');
+                    }
                     const { error: notificationError } = await sb.from('notifications').insert({ user_id: enrollData.student_id, title: '❌ تم رفض Enrollment request', body: 'تم رفض طلبك للتسجيل في الCourse' });
                     if (notificationError) console.warn('Rejection notification could not be sent:', notificationError.message);
-                    await loadAllData(); hideLoading(); showToast('تم رفض الطلب'); renderApp();
+                    hideLoading(); showToast('تم رفض الطلب'); renderApp();
                 } catch (error) {
                     hideLoading(); showToast('تعذر رفض الطلب: ' + (error?.message || 'خطأ غير معروف') + ' — تحقق من RLS.', 'error'); console.error('Enrollment rejection failed:', error);
                 }
